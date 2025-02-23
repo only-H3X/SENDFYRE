@@ -30,60 +30,10 @@ from PyPDF2 import PdfReader, PdfWriter
 from fpdf import FPDF  # For converting TXT/DOCX/HTML to PDF
 import qrcode         # For generating QR codes
 from PIL import Image  # For converting images to PDF
-
-# Try to import xhtml2pdf for improved HTML-to-PDF conversion.
-try:
-    from xhtml2pdf import pisa
-except ImportError:
-    pisa = None
-    logging.warning("xhtml2pdf module not found. HTML attachments will be converted as plain text.")
-
-# Set logging level to INFO.
-logging.getLogger().setLevel(logging.INFO)
+import jinja2         # Unified templating engine
 
 # =============================================================================
-# Minimal helper definitions to avoid NameError issues
-# =============================================================================
-def check_email_validity(email):
-    regex = r"(^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$)"
-    return re.fullmatch(regex, email) is not None
-
-def validate_mx_records(domain):
-    try:
-        mx_records = dns.resolver.resolve(domain, 'MX')
-        return bool(mx_records)
-    except Exception:
-        return False
-
-# =============================================================================
-# GLOBAL VARIABLES AND COUNTERS
-# =============================================================================
-emails_sent = 0
-emails_failed = 0
-SMTP_INDEX = 0  # For round-robin SMTP rotation
-cc_recipients = []  # Global cc list
-bcc_recipients = []  # Global bcc list
-DOMAIN_LOGO_CACHE = {}  # Cache for domain logos
-
-# =============================================================================
-# RATE LIMITER CLASS
-# =============================================================================
-class RateLimiter:
-    def __init__(self, rate: float):
-        self.rate = rate
-        self._lock = asyncio.Lock()
-        self._last = 0.0
-
-    async def wait(self):
-        async with self._lock:
-            now = asyncio.get_event_loop().time()
-            wait_time = max(0, (1.0 / self.rate) - (now - self._last))
-            if wait_time > 0:
-                await asyncio.sleep(wait_time)
-            self._last = asyncio.get_event_loop().time()
-
-# =============================================================================
-# CONFIGURATION & LOGGING SETUP
+# Logging and Configuration Setup
 # =============================================================================
 if not os.path.exists("logs"):
     os.makedirs("logs")
@@ -99,9 +49,6 @@ console_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s
 console_handler.setFormatter(console_formatter)
 logging.getLogger().addHandler(console_handler)
 
-# -----------------------------------------------------------------------------
-# Load external configuration
-# -----------------------------------------------------------------------------
 CONFIG_FILE = "email_config.ini"
 config_parser = configparser.ConfigParser()
 if os.path.exists(CONFIG_FILE):
@@ -120,7 +67,92 @@ def get_config(section, key, default, value_type=str):
         return default
 
 # =============================================================================
-# LOAD CONFIGURATION FROM FILE
+# Helper Functions
+# =============================================================================
+def check_email_validity(email):
+    regex = r"(^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$)"
+    return re.fullmatch(regex, email) is not None
+
+def validate_mx_records(domain):
+    try:
+        mx_records = dns.resolver.resolve(domain, 'MX')
+        return bool(mx_records)
+    except Exception:
+        return False
+
+def process_string(value):
+    """Removes special characters and converts to lowercase."""
+    return re.sub(r'[^a-zA-Z0-9]', '', value).lower()
+
+def encode_base64_custom(value, no_padding=False):
+    encoded = base64.b64encode(value.encode()).decode()
+    return encoded.rstrip('=') if no_padding else encoded
+
+def encode_hex_custom(value):
+    return value.encode().hex()
+
+def obfuscate_hex_custom(value):
+    return ''.join(f"{ord(c):x}" for c in value)
+
+async def read_file_async(file_path, mode="r", encoding="utf-8"):
+    if not os.path.exists(file_path):
+        logging.error(f"File not found: {file_path}")
+        return None
+    return await asyncio.to_thread(lambda: open(file_path, mode, encoding=encoding).read())
+
+def read_file_into_memory(file_path):
+    try:
+        with open(file_path, "rb") as f:
+            return f.read()
+    except Exception as e:
+        logging.error(f"Error reading file {file_path} into memory: {e}")
+        return None
+
+# =============================================================================
+# Rate Limiter Class
+# =============================================================================
+class RateLimiter:
+    def __init__(self, rate: float):
+        self.rate = rate
+        self._lock = asyncio.Lock()
+        self._last = 0.0
+
+    async def wait(self):
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            wait_time = max(0, (1.0 / self.rate) - (now - self._last))
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+            self._last = asyncio.get_event_loop().time()
+
+# =============================================================================
+# Load SMTP Nodes from Configuration
+# =============================================================================
+def load_smtp_nodes():
+    nodes_str = get_config("SMTP", "smtp_nodes", "")
+    nodes = []
+    if nodes_str:
+        for entry in nodes_str.split(";"):
+            parts = entry.strip().split("|")
+            if len(parts) < 4:
+                logging.error(f"SMTP node entry '{entry}' does not have enough fields.")
+                continue
+            node = {
+                "server": parts[0].strip(),
+                "port": int(parts[1].strip()),
+                "email": parts[2].strip(),
+                "password": parts[3].strip(),
+                "sender_name": parts[4].strip() if len(parts) >= 5 else ""
+            }
+            nodes.append(node)
+    if not nodes:
+        logging.error("No SMTP nodes configured in [SMTP] section!")
+    return nodes
+
+NODES = load_smtp_nodes()
+
+# =============================================================================
+# Load Other Configurations
 # =============================================================================
 USE_RANDOM_SENDER         = get_config("GENERAL", "USE_RANDOM_SENDER", True, bool)
 USE_SENDER_NAME           = get_config("GENERAL", "USE_SENDER_NAME", True, bool)
@@ -145,29 +177,6 @@ BATCH_SENDING             = get_config("GENERAL", "BATCH_SENDING", True, bool)
 ROTATE_SMTP               = get_config("GENERAL", "ROTATE_SMTP", False, bool)
 RECIPIENTS_FILE           = get_config("GENERAL", "RECIPIENTS_FILE", "recipients.txt")
 
-def load_smtp_nodes():
-    nodes_str = get_config("SMTP", "smtp_nodes", "")
-    nodes = []
-    if nodes_str:
-        for entry in nodes_str.split(";"):
-            parts = entry.strip().split("|")
-            if len(parts) < 4:
-                logging.error(f"SMTP node entry '{entry}' does not have enough fields.")
-                continue
-            node = {
-                "server": parts[0].strip(),
-                "port": int(parts[1].strip()),
-                "email": parts[2].strip(),
-                "password": parts[3].strip(),
-                "sender_name": parts[4].strip() if len(parts) >= 5 else ""
-            }
-            nodes.append(node)
-    if not nodes:
-        logging.error("No SMTP nodes configured in [SMTP] section!")
-    return nodes
-
-NODES = load_smtp_nodes()
-
 PROXY_HOST = get_config("PROXY", "HOST", "proxy.example.com")
 PROXY_PORT = get_config("PROXY", "PORT", 1080, int)
 PROXY_USER = get_config("PROXY", "USER", "")
@@ -189,7 +198,6 @@ CONVERT_TARGET = get_config("CONVERSION", "CONVERT_TARGET", "converted", str)
 CONVERTED_ATTACHMENT_NAME = get_config("CONVERSION", "CONVERTED_ATTACHMENT_NAME", "attachment_doc", str)
 
 ENABLE_QR = get_config("QR", "ENABLE_QR", False, bool)
-# Read the list of links from the "Link" key in the QR section.
 QR_LINKS = [link.strip() for link in get_config("QR", "Link", "").split(",") if link.strip()]
 ROTATION_MODE = get_config("QR", "ROTATION_MODE", "random", str)
 QR_CURRENT_INDEX = 0
@@ -201,6 +209,14 @@ ENCODE_HEADERS = get_config("HEADERS", "ENCODE_HEADERS", False, bool)
 CUSTOM_FROMMAIL = get_config("SENDER", "CUSTOM_FROMMAIL", "", str)
 CUSTOM_SENDER_NAME = get_config("SENDER", "CUSTOM_SENDER_NAME", "", str)
 
+DEFAULT_TAGS = {
+    "date": datetime.now().strftime("%Y-%m-%d"),
+    "time": datetime.now().strftime("%H:%M"),
+    "company": "Example Corp",
+    "website": "https://example.com",
+    "phone": "+1 (555) 123-4567",
+}
+
 SUBJECTS = []
 if config_parser.has_section("SUBJECTS"):
     subjects_str = get_config("SUBJECTS", "subject_lines", "", str)
@@ -209,95 +225,23 @@ if config_parser.has_section("SUBJECTS"):
     else:
         logging.warning("No subject lines defined in [SUBJECTS] section; using defaults.")
         SUBJECTS = [
-            "Exclusive Deal for You, {{name}}!",
-            "🚀 Special Offer Inside, {{name}}!",
-            "Hey {{name}}, Don't Miss Out!"
+            "Exclusive Deal for You, {{ name }}!",
+            "🚀 Special Offer Inside, {{ name }}!",
+            "Hey {{ name }}, Don't Miss Out!"
         ]
 else:
     logging.warning("Missing [SUBJECTS] section; using default subjects.")
     SUBJECTS = [
-        "Exclusive Deal for You, {{name}}!",
-        "🚀 Special Offer Inside, {{name}}!",
-        "Hey {{name}}, Don't Miss Out!"
+        "Exclusive Deal for You, {{ name }}!",
+        "🚀 Special Offer Inside, {{ name }}!",
+        "Hey {{ name }}, Don't Miss Out!"
     ]
 
 RECIPIENTS_FILE = get_config("RECIPIENTS", "FILE", "recipients.txt")
 
-DEFAULT_TAGS = {
-    "{{date}}": datetime.now().strftime("%Y-%m-%d"),
-    "{{time}}": datetime.now().strftime("%H:%M"),
-    "{{company}}": "Example Corp",
-    "{{website}}": "https://example.com",
-    "{{phone}}": "+1 (555) 123-4567",
-}
-
 # =============================================================================
-# RECIPIENTS LOADING FUNCTION
+# Proxy Configuration
 # =============================================================================
-def load_recipients():
-    if not os.path.exists(RECIPIENTS_FILE):
-        logging.warning(f"Recipients file '{RECIPIENTS_FILE}' not found; using default recipients list.")
-        return [
-            {"name": "John Doe", "email": "john@example.com", "sender": "user1@node.com"},
-            {"name": "Jane Smith", "email": "jane@example.com", "sender": "user2@node.com"},
-            {"name": "Bob Jones", "email": "bob@example.com", "sender": "user3@node.com"},
-        ]
-    ext = os.path.splitext(RECIPIENTS_FILE)[1].lower()
-    recipients_list = []
-    if ext == ".csv":
-        with open(RECIPIENTS_FILE, newline="", encoding="utf-8") as csvfile:
-            sample = csvfile.read(1024)
-            csvfile.seek(0)
-            has_header = csv.Sniffer().has_header(sample)
-            csvfile.seek(0)
-            if has_header:
-                reader = csv.DictReader(csvfile)
-                for row in reader:
-                    email = row.get("email", "").strip()
-                    if not email:
-                        continue
-                    name = row.get("name", email).strip()
-                    sender = row.get("sender", "").strip()
-                    recipients_list.append({"name": name, "email": email, "sender": sender})
-            else:
-                reader = csv.reader(csvfile)
-                for row in reader:
-                    if not row:
-                        continue
-                    if len(row) == 1:
-                        email = row[0].strip()
-                        recipients_list.append({"name": email, "email": email, "sender": ""})
-                    elif len(row) == 2:
-                        name, email = row[0].strip(), row[1].strip()
-                        recipients_list.append({"name": name, "email": email, "sender": ""})
-                    else:
-                        name, email, sender = row[0].strip(), row[1].strip(), row[2].strip()
-                        recipients_list.append({"name": name, "email": email, "sender": sender})
-    elif ext == ".txt":
-        with open(RECIPIENTS_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                if "," in line:
-                    parts = [part.strip() for part in line.split(",")]
-                    if len(parts) == 1:
-                        email = parts[0]
-                        recipients_list.append({"name": email, "email": email, "sender": ""})
-                    elif len(parts) == 2:
-                        name, email = parts[0], parts[1]
-                        recipients_list.append({"name": name, "email": email, "sender": ""})
-                    elif len(parts) >= 3:
-                        name, email, sender = parts[0], parts[1], parts[2]
-                        recipients_list.append({"name": name, "email": email, "sender": sender})
-                else:
-                    recipients_list.append({"name": line, "email": line, "sender": ""})
-    else:
-        logging.warning(f"Unsupported file extension for recipients file: {RECIPIENTS_FILE}")
-    return recipients_list
-
-recipients = load_recipients()
-
 def configure_proxy():
     if USE_PROXY:
         try:
@@ -310,15 +254,163 @@ def configure_proxy():
 if USE_PROXY:
     configure_proxy()
 
-async def read_file_async(file_path, mode="r", encoding="utf-8"):
+# =============================================================================
+# Unified Templating System with Jinja2
+# =============================================================================
+class TemplateProcessor:
+    def __init__(self, context):
+        self.context = context
+        self.env = jinja2.Environment(autoescape=True)
+        # Custom filters for encoding operations
+        self.env.filters['base64'] = lambda s: base64.b64encode(s.encode()).decode() if isinstance(s, str) else s
+        self.env.filters['hex'] = lambda s: s.encode().hex() if isinstance(s, str) else s
+        self.env.filters['obfhex'] = lambda s: ''.join(f"{ord(c):x}" for c in s) if isinstance(s, str) else s
+
+    def render(self, template_str):
+        template = self.env.from_string(template_str)
+        return template.render(self.context)
+
+def build_context(recipient, sender_name, sender_domain, link):
+    domain_raw = recipient["email"].split("@")[-1]
+    domain = process_string(domain_raw)
+    context = {
+        'date': datetime.now().strftime("%Y-%m-%d"),
+        'time': datetime.now().strftime("%H:%M"),
+        'company': "Example Corp",
+        'website': "https://example.com",
+        'phone': "+1 (555) 123-4567",
+        'name': recipient["name"],
+        'email': recipient["email"],
+        'victimname': process_string(recipient["name"]),
+        'victimemail': recipient["email"],
+        'victimdomain': domain,
+        'victimfulldomain': domain_raw,
+        'victimb64email': encode_base64_custom(recipient["email"]),
+        'victimb64emailnp': encode_base64_custom(recipient["email"], no_padding=True),
+        'victimhexemail': encode_hex_custom(recipient["email"]),
+        'victimobfhexemail': obfuscate_hex_custom(recipient["email"]),
+        'victimb64domain': encode_base64_custom(domain),
+        'victimb64name': encode_base64_custom(process_string(recipient["name"])),
+        'victimdomainlogo': f'<img src="data:image/png;base64,{get_domain_logo(domain)}" alt="Domain Logo">' if get_domain_logo(domain) else "",
+        'victimdomainlogosrc': get_domain_logo(domain) or "",
+        'victimrealdomain': domain_raw,
+        'myname': sender_name,
+        'mydomain': sender_domain,
+        'link': link,
+        'linkb64': encode_base64_custom(link),
+        'qrcode': f'<img src="data:image/png;base64,{base64.b64encode(generate_qr_code_image(link)).decode("utf-8")}" alt="QR Code">',
+        'qrcodedata': encode_base64_custom(generate_qr_code_image(link).decode("latin1")),
+        'domainlogo': f'<img src="data:image/png;base64,{get_domain_logo(domain)}" alt="Domain Logo">' if get_domain_logo(domain) else "",
+    }
+    # Merge default tags for backwards compatibility.
+    context.update(DEFAULT_TAGS)
+    return context
+
+# =============================================================================
+# Domain Logo and QR Code Functions
+# =============================================================================
+DOMAIN_LOGO_CACHE = {}
+
+def get_domain_logo(domain):
+    if not FETCH_DOMAIN_LOGO:
+        return None
+    if domain in DOMAIN_LOGO_CACHE:
+        return DOMAIN_LOGO_CACHE[domain]
+    logo_url = f"https://logo.clearbit.com/{domain}"
+    try:
+        response = requests.get(logo_url, timeout=5)
+        if response.status_code == 200:
+            encoded_logo = base64.b64encode(response.content).decode()
+            DOMAIN_LOGO_CACHE[domain] = encoded_logo
+            return encoded_logo
+    except requests.RequestException as e:
+        logging.warning(f"Could not fetch logo for {domain}: {e}")
+    return None
+
+def generate_qr_code_image(link):
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(link)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+    return buf.getvalue()
+
+def get_qr_link():
+    global QR_CURRENT_INDEX
+    if ROTATION_MODE.lower() == "random":
+        return random.choice(QR_LINKS)
+    elif ROTATION_MODE.lower() == "sequential":
+        link = QR_LINKS[QR_CURRENT_INDEX]
+        QR_CURRENT_INDEX = (QR_CURRENT_INDEX + 1) % len(QR_LINKS)
+        return link
+    else:
+        return random.choice(QR_LINKS)
+
+# =============================================================================
+# Attachment Personalization Functions (Using Unified Templating)
+# =============================================================================
+def replace_tags_in_docx(file_path, recipient):
+    if not ATTACHMENTS_TAG_REPLACEMENT:
+        return None
+    try:
+        doc = Document(file_path)
+        context = build_context(recipient, "", "", "")
+        processor = TemplateProcessor(context)
+        for para in doc.paragraphs:
+            para.text = processor.render(para.text)
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+        filename = f"{os.path.splitext(os.path.basename(file_path))[0]}_{recipient['email']}.docx"
+        return (filename, buf.getvalue())
+    except Exception as e:
+        logging.error(f"Error processing DOCX {file_path}: {e}")
+        return None
+
+def replace_tags_in_txt(file_path, recipient):
+    if not ATTACHMENTS_TAG_REPLACEMENT:
+        return None
     if not os.path.exists(file_path):
         logging.error(f"File not found: {file_path}")
         return None
-    return await asyncio.to_thread(lambda: open(file_path, mode, encoding=encoding).read())
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        context = build_context(recipient, "", "", "")
+        new_content = TemplateProcessor(context).render(content)
+        filename = f"{os.path.splitext(os.path.basename(file_path))[0]}_{recipient['email']}.txt"
+        return (filename, new_content.encode("utf-8"))
+    except Exception as e:
+        logging.error(f"Error processing TXT {file_path}: {e}")
+        return None
 
-# =============================================================================
-# CONVERSION FUNCTION (in-memory, with placeholder replacement)
-# =============================================================================
+def replace_tags_in_pdf(file_path, recipient):
+    if not ATTACHMENTS_TAG_REPLACEMENT:
+        return None
+    if not os.path.exists(file_path):
+        logging.error(f"File not found: {file_path}")
+        return None
+    try:
+        reader = PdfReader(file_path)
+        writer = PdfWriter()
+        for page in reader.pages:
+            writer.add_page(page)
+        buf = io.BytesIO()
+        writer.write(buf)
+        buf.seek(0)
+        filename = f"{os.path.splitext(os.path.basename(file_path))[0]}_{recipient['email']}.pdf"
+        return (filename, buf.getvalue())
+    except Exception as e:
+        logging.error(f"Error processing PDF {file_path}: {e}")
+        return None
+
 def convert_attachment(file_path, target_format, recipient=None):
     base, ext = os.path.splitext(file_path)
     ext = ext.lower().lstrip(".")
@@ -338,7 +430,9 @@ def convert_attachment(file_path, target_format, recipient=None):
                 with open(file_path, "r", encoding="utf-8") as f:
                     lines = f.readlines()
                 if recipient and ATTACHMENTS_TAG_REPLACEMENT:
-                    lines = [replace_tags_in_text(line, recipient) for line in lines]
+                    context = build_context(recipient, "", "", "")
+                    processor = TemplateProcessor(context)
+                    lines = [processor.render(line) for line in lines]
                 for line in lines:
                     pdf.multi_cell(0, 10, txt=line.strip())
                 pdf.output(out_buf)
@@ -354,7 +448,8 @@ def convert_attachment(file_path, target_format, recipient=None):
                     with open(file_path, "r", encoding="utf-8") as f:
                         html_content = f.read()
                     if recipient and ATTACHMENTS_TAG_REPLACEMENT:
-                        html_content = replace_tags_in_text(html_content, recipient)
+                        context = build_context(recipient, "", "", "")
+                        html_content = TemplateProcessor(context).render(html_content)
                     pisa_status = pisa.CreatePDF(html_content, dest=out_buf)
                     if pisa_status.err:
                         logging.error(f"Error converting HTML {file_path} to PDF using xhtml2pdf.")
@@ -374,7 +469,9 @@ def convert_attachment(file_path, target_format, recipient=None):
                     with open(file_path, "r", encoding="utf-8") as f:
                         lines = f.readlines()
                     if recipient and ATTACHMENTS_TAG_REPLACEMENT:
-                        lines = [replace_tags_in_text(line, recipient) for line in lines]
+                        context = build_context(recipient, "", "", "")
+                        processor = TemplateProcessor(context)
+                        lines = [processor.render(line) for line in lines]
                     for line in lines:
                         pdf.multi_cell(0, 10, txt=line.strip())
                     pdf.output(out_buf)
@@ -388,8 +485,10 @@ def convert_attachment(file_path, target_format, recipient=None):
             try:
                 doc = Document(file_path)
                 if recipient and ATTACHMENTS_TAG_REPLACEMENT:
+                    context = build_context(recipient, "", "", "")
+                    processor = TemplateProcessor(context)
                     for para in doc.paragraphs:
-                        para.text = replace_tags_in_text(para.text, recipient)
+                        para.text = processor.render(para.text)
                 pdf = FPDF()
                 pdf.add_page()
                 pdf.set_auto_page_break(auto=True, margin=15)
@@ -422,128 +521,6 @@ def convert_attachment(file_path, target_format, recipient=None):
             return None
     else:
         logging.info(f"Target conversion format '{target}' not supported; skipping conversion for {file_path}")
-        return None
-
-# =============================================================================
-# READ FILE INTO MEMORY (for non-converted attachments)
-# =============================================================================
-def read_file_into_memory(file_path):
-    try:
-        with open(file_path, "rb") as f:
-            return f.read()
-    except Exception as e:
-        logging.error(f"Error reading file {file_path} into memory: {e}")
-        return None
-
-# =============================================================================
-# QR CODE GENERATION FUNCTION (in-memory)
-# =============================================================================
-def generate_qr_code_image(link):
-    qr = qrcode.QRCode(
-        version=1,
-        error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=10,
-        border=4,
-    )
-    qr.add_data(link)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    buf.seek(0)
-    return buf.getvalue()
-
-def get_qr_link():
-    global QR_CURRENT_INDEX
-    if ROTATION_MODE.lower() == "random":
-        return random.choice(QR_LINKS)
-    elif ROTATION_MODE.lower() == "sequential":
-        link = QR_LINKS[QR_CURRENT_INDEX]
-        QR_CURRENT_INDEX = (QR_CURRENT_INDEX + 1) % len(QR_LINKS)
-        return link
-    else:
-        return random.choice(QR_LINKS)
-
-# =============================================================================
-# PERSONALIZATION FUNCTIONS
-# =============================================================================
-def replace_tags_in_text(content, recipient):
-    if not EMAIL_BODY_TAG_REPLACEMENT:
-        return content
-    tags = {**DEFAULT_TAGS, "{{name}}": recipient["name"], "{{email}}": recipient["email"]}
-    for tag, value in tags.items():
-        content = content.replace(tag, value)
-    # Replace QR code placeholder with a data URI
-    if "##qrcode##" in content:
-        # Generate a QR code image for the given link (if available via recipient context, you may extend this)
-        # Here we use a default link if none is provided.
-        default_link = "https://example.com"
-        qr_data = generate_qr_code_image(default_link)
-        data_uri = f"data:image/png;base64,{base64.b64encode(qr_data).decode('utf-8')}"
-        content = content.replace("##qrcode##", f'<img src="{data_uri}" alt="QR Code">')
-    # Replace domain logo placeholder.
-    if "##domainlogo##" in content:
-        domain = recipient["email"].split("@")[-1]
-        logo = get_domain_logo(domain)
-        if logo:
-            content = content.replace("##domainlogo##", f'<img src="data:image/png;base64,{logo}" alt="Domain Logo">')
-        else:
-            content = content.replace("##domainlogo##", "")
-    return content
-
-def replace_tags_in_docx(file_path, recipient):
-    if not ATTACHMENTS_TAG_REPLACEMENT:
-        return None
-    try:
-        doc = Document(file_path)
-        for para in doc.paragraphs:
-            para.text = replace_tags_in_text(para.text, recipient)
-        buf = io.BytesIO()
-        doc.save(buf)
-        buf.seek(0)
-        filename = f"{os.path.splitext(os.path.basename(file_path))[0]}_{recipient['email']}.docx"
-        return (filename, buf.getvalue())
-    except Exception as e:
-        logging.error(f"Error processing DOCX {file_path}: {e}")
-        return None
-
-def replace_tags_in_txt(file_path, recipient):
-    if not ATTACHMENTS_TAG_REPLACEMENT:
-        return None
-    if not os.path.exists(file_path):
-        logging.error(f"File not found: {file_path}")
-        return None
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        new_content = replace_tags_in_text(content, recipient)
-        filename = f"{os.path.splitext(os.path.basename(file_path))[0]}_{recipient['email']}.txt"
-        return (filename, new_content.encode("utf-8"))
-    except Exception as e:
-        logging.error(f"Error processing TXT {file_path}: {e}")
-        return None
-
-def replace_tags_in_pdf(file_path, recipient):
-    if not ATTACHMENTS_TAG_REPLACEMENT:
-        return None
-    if not os.path.exists(file_path):
-        logging.error(f"File not found: {file_path}")
-        return None
-    try:
-        reader = PdfReader(file_path)
-        writer = PdfWriter()
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                replaced_text = replace_tags_in_text(text, recipient)
-            writer.add_page(page)
-        buf = io.BytesIO()
-        writer.write(buf)
-        buf.seek(0)
-        filename = f"{os.path.splitext(os.path.basename(file_path))[0]}_{recipient['email']}.pdf"
-        return (filename, buf.getvalue())
-    except Exception as e:
-        logging.error(f"Error processing PDF {file_path}: {e}")
         return None
 
 def personalize_attachments(recipient):
@@ -626,90 +603,97 @@ def get_smtp_node(recipient):
         return next((node for node in NODES if node["email"] == sender_email), NODES[0])
 
 def get_subject_line(recipient):
+    domain = recipient["email"].split("@")[-1]
+    node = get_smtp_node(recipient)
+    sender_name = node["sender_name"]
+    chosen_qr_link = get_qr_link() if (ENABLE_QR and QR_LINKS) else ""
+    context = build_context(recipient, sender_name, domain, chosen_qr_link)
     if ROTATE_SUBJECTS and SUBJECTS:
         raw_subject = random.choice(SUBJECTS)
-        subject_text = replace_tags_in_text(raw_subject, recipient)
     else:
-        subject_text = f"Hello {recipient['name']}, Your Personalized Offer!"
+        raw_subject = f"Hello {recipient['name']}, Your Personalized Offer!"
+    subject_text = TemplateProcessor(context).render(raw_subject)
     if ENCODE_HEADERS:
         return str(Header(subject_text, "utf-8"))
     else:
         return subject_text
 
-def get_domain_logo(domain):
-    if not FETCH_DOMAIN_LOGO:
-        return None
-    if domain in DOMAIN_LOGO_CACHE:
-        return DOMAIN_LOGO_CACHE[domain]
-    logo_url = f"https://logo.clearbit.com/{domain}"
-    try:
-        response = requests.get(logo_url, timeout=5)
-        if response.status_code == 200:
-            buf = io.BytesIO(response.content)
-            buf.seek(0)
-            encoded_logo = base64.b64encode(buf.getvalue()).decode()
-            DOMAIN_LOGO_CACHE[domain] = encoded_logo
-            return encoded_logo
-    except requests.RequestException as e:
-        logging.warning(f"Could not fetch logo for {domain}: {e}")
-    return None
+# =============================================================================
+# Recipients Loading
+# =============================================================================
+def load_recipients():
+    if not os.path.exists(RECIPIENTS_FILE):
+        logging.warning(f"Recipients file '{RECIPIENTS_FILE}' not found; using default recipients list.")
+        return [
+            {"name": "John Doe", "email": "john@example.com", "sender": "user1@node.com"},
+            {"name": "Jane Smith", "email": "jane@example.com", "sender": "user2@node.com"},
+            {"name": "Bob Jones", "email": "bob@example.com", "sender": "user3@node.com"},
+        ]
+    ext = os.path.splitext(RECIPIENTS_FILE)[1].lower()
+    recipients_list = []
+    if ext == ".csv":
+        with open(RECIPIENTS_FILE, newline="", encoding="utf-8") as csvfile:
+            sample = csvfile.read(1024)
+            csvfile.seek(0)
+            has_header = csv.Sniffer().has_header(sample)
+            csvfile.seek(0)
+            if has_header:
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    email = row.get("email", "").strip()
+                    if not email:
+                        continue
+                    name = row.get("name", email).strip()
+                    sender = row.get("sender", "").strip()
+                    recipients_list.append({"name": name, "email": email, "sender": sender})
+            else:
+                reader = csv.reader(csvfile)
+                for row in reader:
+                    if not row:
+                        continue
+                    if len(row) == 1:
+                        email = row[0].strip()
+                        recipients_list.append({"name": email, "email": email, "sender": ""})
+                    elif len(row) == 2:
+                        name, email = row[0].strip(), row[1].strip()
+                        recipients_list.append({"name": name, "email": email, "sender": ""})
+                    else:
+                        name, email, sender = row[0].strip(), row[1].strip(), row[2].strip()
+                        recipients_list.append({"name": name, "email": email, "sender": sender})
+    elif ext == ".txt":
+        with open(RECIPIENTS_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if "," in line:
+                    parts = [part.strip() for part in line.split(",")]
+                    if len(parts) == 1:
+                        email = parts[0]
+                        recipients_list.append({"name": email, "email": email, "sender": ""})
+                    elif len(parts) == 2:
+                        name, email = parts[0], parts[1]
+                        recipients_list.append({"name": name, "email": email, "sender": ""})
+                    elif len(parts) >= 3:
+                        name, email, sender = parts[0], parts[1], parts[2]
+                        recipients_list.append({"name": name, "email": email, "sender": sender})
+                else:
+                    recipients_list.append({"name": line, "email": line, "sender": ""})
+    else:
+        logging.warning(f"Unsupported file extension for recipients file: {RECIPIENTS_FILE}")
+    return recipients_list
+
+recipients = load_recipients()
 
 # =============================================================================
-# CUSTOM PLACEHOLDERS (for advanced personalization)
+# Email Sending Class
 # =============================================================================
-def process_string(value):
-    """Removes special characters and converts to lowercase."""
-    return re.sub(r'[^a-zA-Z0-9]', '', value).lower()
+SMTP_INDEX = 0  # Global SMTP index for rotation
+cc_recipients = []  # Global cc list
+bcc_recipients = []  # Global bcc list
+emails_sent = 0
+emails_failed = 0
 
-def encode_base64_custom(value, no_padding=False):
-    encoded = base64.b64encode(value.encode()).decode()
-    return encoded.rstrip('=') if no_padding else encoded
-
-def encode_hex_custom(value):
-    return value.encode().hex()
-
-def obfuscate_hex_custom(value):
-    return ''.join(f"{ord(c):x}" for c in value)
-
-def replace_placeholders(content, recipient, sender_name, sender_domain, link):
-    """Replaces custom placeholders in the email body and subject."""
-    victim_name = process_string(recipient["name"])
-    victim_email = recipient["email"]
-    victim_domain = process_string(recipient["email"].split("@")[-1])
-    victim_full_domain = recipient["email"].split("@")[-1]
-
-    placeholders = {
-        "##victimname##": victim_name,
-        "##victimemail##": victim_email,
-        "##victimdomain##": victim_domain,
-        "##victimfulldomain##": victim_full_domain,
-        "##victimb64email##": encode_base64_custom(victim_email),
-        "##victimb64emailnp##": encode_base64_custom(victim_email, no_padding=True),
-        "##victimhexemail##": encode_hex_custom(victim_email),
-        "##victimobfhexemail##": obfuscate_hex_custom(victim_email),
-        "##victimb64domain##": encode_base64_custom(victim_domain),
-        "##victimb64name##": encode_base64_custom(victim_name),
-        "##victimdomainlogo##": f'<img src="data:image/png;base64,{get_domain_logo(victim_domain)}" alt="Domain Logo">' if get_domain_logo(victim_domain) else "",
-        "##victimdomainlogosrc##": get_domain_logo(victim_domain) or "",
-        "##victimrealdomain##": victim_full_domain,
-        "##myname##": sender_name,
-        "##mydomain##": sender_domain,
-        "##link##": link,
-        "##linkb64##": encode_base64_custom(link),
-        "##qrcode##": f'<img src="data:image/png;base64,{base64.b64encode(generate_qr_code_image(link)).decode("utf-8")}" alt="QR Code">',
-        "##qrcodedata##": encode_base64_custom(generate_qr_code_image(link).decode("latin1")),
-        "##domainlogo##": f'<img src="data:image/png;base64,{get_domain_logo(victim_domain)}" alt="Domain Logo">' if get_domain_logo(victim_domain) else "",
-        "##date(1)##": datetime.now().strftime("%Y-%m-%d"),
-    }
-
-    for placeholder, value in placeholders.items():
-        content = content.replace(placeholder, value)
-
-    return content
-
-# =============================================================================
-# EMAIL SENDER CLASS
-# =============================================================================
 class EmailSender:
     def __init__(self, semaphore, rate_limiter):
         self.semaphore = semaphore
@@ -725,29 +709,23 @@ class EmailSender:
             logging.error(f"Skipping invalid email: {recipient['email']}")
             emails_failed += 1
             return
-        domain = recipient["email"].split("@")[-1]
-        if not validate_mx_records(domain):
-            logging.error(f"Domain {domain} cannot receive emails. Skipping {recipient['email']}.")
+        domain_raw = recipient["email"].split("@")[-1]
+        if not validate_mx_records(domain_raw):
+            logging.error(f"Domain {domain_raw} cannot receive emails. Skipping {recipient['email']}.")
             emails_failed += 1
             return
         node = get_smtp_node(recipient)
         sender_email = node["email"]
         sender_name = node["sender_name"]
-        logo_data = get_domain_logo(domain)
+        logo_data = get_domain_logo(process_string(domain_raw))
         html_template = await read_file_async(HTML_TEMPLATE_FILE_PATH)
         if html_template is None:
             logging.error("HTML template not found. Aborting email send.")
             emails_failed += 1
             return
-        # Process standard tag replacements.
-        html_content = replace_tags_in_text(html_template, recipient)
-        # Choose a QR link from the config (if enabled) using rotation.
-        if ENABLE_QR and QR_LINKS:
-            chosen_qr_link = get_qr_link()
-        else:
-            chosen_qr_link = ""
-        # Apply custom placeholder replacements (including ##qrcode## and ##domainlogo##).
-        html_content = replace_placeholders(html_content, recipient, sender_name, domain, chosen_qr_link)
+        chosen_qr_link = get_qr_link() if (ENABLE_QR and QR_LINKS) else ""
+        context = build_context(recipient, sender_name, domain_raw, chosen_qr_link)
+        html_content = TemplateProcessor(context).render(html_template)
         msg = MIMEMultipart()
         msg["From"] = build_from_header(sender_email, sender_name)
         msg["To"] = recipient["email"]
@@ -766,7 +744,6 @@ class EmailSender:
         msg.attach(MIMEText(html_content, "html"))
         if FETCH_DOMAIN_LOGO and logo_data:
             try:
-                # Attach logo from memory (decoded from base64)
                 logo_attachment = MIMEImage(base64.b64decode(logo_data), _subtype="png")
                 logo_attachment.add_header("Content-ID", "<logo_image>")
                 logo_attachment.add_header("Content-Disposition", "inline", filename="logo.png")
@@ -775,7 +752,6 @@ class EmailSender:
                 logging.error(f"Error attaching logo: {e}")
         if ENABLE_QR and QR_LINKS:
             try:
-                # Use the same chosen QR link for embedding.
                 qr_data = generate_qr_code_image(chosen_qr_link)
                 qr_attachment = MIMEImage(qr_data, _subtype="png")
                 qr_attachment.add_header("Content-ID", "<qr_code>")
@@ -801,12 +777,12 @@ class EmailSender:
         while attempt < MAX_RETRIES:
             try:
                 async with self.semaphore:
-                    context = ssl.create_default_context() if USE_TLS else None
+                    context_ssl = ssl.create_default_context() if USE_TLS else None
                     async with aiosmtplib.SMTP(
                         hostname=node["server"],
                         port=node["port"],
                         start_tls=USE_TLS,
-                        tls_context=context
+                        tls_context=context_ssl
                     ) as server:
                         if not SKIP_AUTH:
                             await server.login(sender_email, node["password"])
@@ -823,6 +799,9 @@ class EmailSender:
             logging.error(f"❌ All retry attempts failed for {recipient['email']}.")
             emails_failed += 1
 
+# =============================================================================
+# Main Execution
+# =============================================================================
 async def send_bulk_emails():
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONNECTIONS)
     rate_limiter = RateLimiter(EMAILS_PER_SECOND)

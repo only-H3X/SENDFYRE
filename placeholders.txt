@@ -1,0 +1,87 @@
+Unified Email Template Placeholders
+
+Below are the available placeholders (using the Jinja2 syntax) for personalization:
+
+{{ date }} 
+   - Current date in YYYY-MM-DD format.
+
+{{ time }} 
+   - Current time in HH:MM format.
+
+{{ company }} 
+   - Company name (default: Example Corp).
+
+{{ website }} 
+   - Website URL (default: https://example.com).
+
+{{ phone }} 
+   - Company phone number (default: +1 (555) 123-4567).
+
+{{ name }} 
+   - Recipient's name.
+
+{{ email }} 
+   - Recipient's email address.
+
+{{ victimname }} 
+   - Processed version of the recipient's name (alphanumeric, lowercase).
+
+{{ victimemail }} 
+   - Recipient's email address (same as {{ email }}).
+
+{{ victimdomain }} 
+   - Processed domain from the recipient's email (lowercase, alphanumeric).
+
+{{ victimfulldomain }} 
+   - Full domain part of the recipient's email (e.g., example.com).
+
+{{ victimb64email }} 
+   - Base64 encoded email address (with padding).
+
+{{ victimb64emailnp }} 
+   - Base64 encoded email address without padding.
+
+{{ victimhexemail }} 
+   - Hexadecimal encoding of the recipient's email.
+
+{{ victimobfhexemail }} 
+   - Obfuscated hexadecimal encoding of the recipient's email.
+
+{{ victimb64domain }} 
+   - Base64 encoded domain (processed version).
+
+{{ victimb64name }} 
+   - Base64 encoded processed recipient name.
+
+{{ victimdomainlogo }} 
+   - HTML image tag containing the domain logo (if available).
+
+{{ victimdomainlogosrc }} 
+   - Base64 encoded data of the domain logo.
+
+{{ victimrealdomain }} 
+   - The actual domain part from the recipient's email address.
+
+{{ myname }} 
+   - Sender's name.
+
+{{ mydomain }} 
+   - Sender's domain.
+
+{{ link }} 
+   - A URL link provided for personalization.
+
+{{ linkb64 }} 
+   - Base64 encoded version of the provided link.
+
+{{ qrcode }} 
+   - HTML image tag displaying a QR code for the provided link.
+
+{{ qrcodedata }} 
+   - Base64 encoded QR code image data.
+
+{{ domainlogo }} 
+   - HTML image tag for the domain logo (alternative to victimdomainlogo).
+
+Note:
+Additional default tags such as company, website, and phone are also merged into the template context.
