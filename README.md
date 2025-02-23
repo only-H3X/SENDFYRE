@@ -1,6 +1,6 @@
-# Email Sender
+# SENDFYRE
 
-**Email Sender** is an asynchronous Python tool for sending customizable email campaigns. It includes advanced features such as multi-node SMTP support, proxy usage, file conversion and encoding, inline QR code generation, custom header/priority settings, enhanced email validation, custom sender configuration, and send rate control.
+**SENDFYRE Email Sender** is an asynchronous Python tool for sending customizable email campaigns. It includes advanced features such as multi-node SMTP support, proxy usage, file conversion and encoding, inline QR code generation, custom header/priority settings, enhanced email validation, custom sender configuration, and send rate control.
 
 ## Table of Contents
 
