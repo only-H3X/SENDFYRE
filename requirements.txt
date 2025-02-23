@@ -1,0 +1,11 @@
+dnspython
+requests
+aiosmtplib
+PySocks
+validate_email_address
+python-docx
+PyPDF2
+fpdf
+qrcode
+Pillow
+xhtml2pdf

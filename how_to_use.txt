@@ -1,0 +1,26 @@
+# HOW TO USE THE EMAIL SENDER
+
+## Step 1: Install Dependencies
+Run:
+    python scripts/check_install_dependencies.py
+
+## Step 2: Configure Settings
+Edit:
+    config/config.ini  (SMTP settings, email settings, attachments)
+
+## Step 3: Add Recipients
+Modify:
+    data/recipients.txt  (Add emails to send to)
+
+## Step 4: Run the Sender
+Execute:
+    python scripts/sender.py
+
+## Step 5: Monitor Logs
+To view real-time logs:
+    tail -f logs/email_sender.log
+
+## Step 6: Troubleshooting
+If emails are not sent:
+    - Check SMTP credentials in `config/config.ini`
+    - Ensure your SMTP provider allows bulk sending
